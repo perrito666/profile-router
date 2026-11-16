@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, sign, and package macOS app
+    # CI uses Apple Silicon; releases also exercise the universal bundle on Intel.
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      APP_BUNDLE: dist/Profile Router.app
+      # Same secret names as perrito666/textchum and perrito666/clipchum.
+      # With no certificate, builds remain explicitly ad-hoc signed.
+      # A configured certificate requires a complete notarization credential set.
+      HAVE_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Validate signing configuration
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${CERT_PASSWORD:?Set MACOS_CERTIFICATE_PASSWORD}"
+          if [[ -n "$API_KEY_P8" ]]; then
+            : "${API_KEY_ID:?Set APPLE_API_KEY_ID}"
+            : "${API_ISSUER_ID:?Set APPLE_API_ISSUER_ID}"
+          else
+            : "${APPLE_ID:?Set APPLE_ID or the complete APPLE_API_KEY_* credential set}"
+            : "${APPLE_APP_SPECIFIC_PASSWORD:?Set APPLE_APP_SPECIFIC_PASSWORD}"
+            : "${APPLE_TEAM_ID:?Set APPLE_TEAM_ID}"
+          fi
+
+      - name: Test routing
+        run: swift test
+
+      - name: Build universal app
+        run: bash scripts/build-app.sh --arch arm64 --arch x86_64
+
+      - name: Stamp release version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            RELEASE_VERSION="$(plutil -extract CFBundleShortVersionString raw "$APP_BUNDLE/Contents/Info.plist")"
+          fi
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Expected a version such as v0.1.4" >&2; exit 1; }
+          plutil -replace CFBundleShortVersionString -string "$RELEASE_VERSION" "$APP_BUNDLE/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$RELEASE_VERSION" "$APP_BUNDLE/Contents/Info.plist"
+          echo "RELEASE_VERSION=$RELEASE_VERSION" >> "$GITHUB_ENV"
+
+      - name: Sign app with Developer ID
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNING_KEYCHAIN="$RUNNER_TEMP/profile-router-signing.keychain-db"
+          umask 077
+          SIGNING_KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::$SIGNING_KEYCHAIN_PASSWORD"
+          security create-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+          security set-keychain-settings -lut 1800 "$SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/profile-router-cert.p12"
+          security import "$RUNNER_TEMP/profile-router-cert.p12" -k "$SIGNING_KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -k "$SIGNING_KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$SIGNING_KEYCHAIN" login.keychain-db
+          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$SIGNING_KEYCHAIN" | awk -F'"' '/Developer ID Application/{print $2; exit}')"
+          test -n "$SIGNING_IDENTITY"
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          codesign --force --options runtime --timestamp --entitlements Resources/ProfileRouter.entitlements --sign "$SIGNING_IDENTITY" "$APP_BUNDLE"
+          codesign --verify --deep --strict "$APP_BUNDLE"
+
+      - name: Re-sign ad hoc when no certificate is configured
+        if: env.HAVE_SIGNING != 'true'
+        run: |
+          codesign --force --options runtime --entitlements Resources/ProfileRouter.entitlements --sign - "$APP_BUNDLE"
+          codesign --verify --deep --strict "$APP_BUNDLE"
+
+      - name: Notarize and staple app
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ditto -c -k --keepParent "$APP_BUNDLE" "$RUNNER_TEMP/profile-router-notarize.zip"
+          bash scripts/notarize.sh "$RUNNER_TEMP/profile-router-notarize.zip"
+          xcrun stapler staple "$APP_BUNDLE"
+          xcrun stapler validate "$APP_BUNDLE"
+          spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+
+      - name: Verify URL and HTML file delivery in shipping bundle
+        run: python3 scripts/test-url-events.py
+
+      - name: Build disk image
+        run: bash scripts/build-dmg.sh "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+
+      - name: Sign, notarize, and staple disk image
+        if: env.HAVE_SIGNING == 'true'
+        env:
+          API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --force --timestamp --sign "$SIGNING_IDENTITY" "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+          bash scripts/notarize.sh "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+          codesign --verify --strict "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+          xcrun stapler staple "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+          xcrun stapler validate "dist/ProfileRouter-${RELEASE_VERSION}.dmg"
+
+      - name: Package ZIP and checksum downloads
+        run: |
+          ditto -c -k --keepParent "$APP_BUNDLE" "dist/ProfileRouter-${RELEASE_VERSION}.zip"
+          cd dist
+          shasum -a 256 "ProfileRouter-${RELEASE_VERSION}.zip" > "ProfileRouter-${RELEASE_VERSION}.zip.sha256"
+          shasum -a 256 "ProfileRouter-${RELEASE_VERSION}.dmg" > "ProfileRouter-${RELEASE_VERSION}.dmg.sha256"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ProfileRouter-release-${{ env.RELEASE_VERSION }}
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$HAVE_SIGNING" == true ]]; then
+            MAC_NOTE="Signed with Developer ID and notarized by Apple. Open the DMG and drag Profile Router to Applications."
+          else
+            MAC_NOTE="This build is ad-hoc signed, without Developer ID signing or Apple notarization. Build from source if macOS blocks the download."
+          fi
+          printf '%s\n\n%s\n' "$MAC_NOTE" "Requires macOS 13 or later; includes Apple Silicon and Intel support. MIT licensed." > "$RUNNER_TEMP/profile-router-release-notes.txt"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "Profile Router $GITHUB_REF_NAME" \
+            --generate-notes --notes-file "$RUNNER_TEMP/profile-router-release-notes.txt" \
+            "dist/ProfileRouter-${RELEASE_VERSION}.zip" "dist/ProfileRouter-${RELEASE_VERSION}.zip.sha256" \
+            "dist/ProfileRouter-${RELEASE_VERSION}.dmg" "dist/ProfileRouter-${RELEASE_VERSION}.dmg.sha256"
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/profile-router-signing.keychain-db" ]]; then
+            security delete-keychain "$RUNNER_TEMP/profile-router-signing.keychain-db" || echo "::warning::Could not remove temporary signing keychain"
+          fi
+          rm -f "$RUNNER_TEMP/profile-router-cert.p12" "$RUNNER_TEMP/profile-router-AuthKey.p8"
